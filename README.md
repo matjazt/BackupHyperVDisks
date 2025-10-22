@@ -1,6 +1,6 @@
 # BackupHyperVDisks
 
-A PowerShell script that creates export-only backups of stopped Hyper-V virtual machines using timestamp-based change detection.
+A PowerShell script that creates backups of stopped Hyper-V virtual machines using timestamp-based change detection.
 
 ## What it does
 
@@ -43,22 +43,9 @@ $TimestampFormat = "yyyy-MM-dd_HH-mm-ss"    # Folder naming format
    .\BackupHyperVDisks.ps1
    ```
 
-## Output structure
+You can of course create a desktop shortcut to run the script. In this case, the PowerShell switch  `-NoExit` is recommended, so you can inspect the script output when it's done.
 
-```
-BackupRoot\
-├── VM1\
-│   ├── 2024-10-22_14-30-15\
-│   │   └── Export\
-│   │       ├── Virtual Machines\
-│   │       ├── Virtual Hard Disks\
-│   │       └── Snapshots\
-│   └── 2024-10-23_09-15-42\
-│       └── Export\
-└── VM2\
-    └── 2024-10-22_14-35-20\
-        └── Export\
-```
+You might want to enable NTFS compression on the backup folder, as the script itself doesn't compress the archives.
 
 ## Notes
 
