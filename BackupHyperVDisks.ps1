@@ -126,10 +126,10 @@ foreach ($vm in $backupVMs) {
     $vmName = $vm.Name
     Write-Host "`nProcessing VM: $vmName" -ForegroundColor Cyan
 
-    if ($vmName -ne "TumbleDev")
-    {
-        continue;
-    }
+    # if ($vmName -ne "TumbleDev")
+    #{
+    #    continue;
+    #}
 
     $vmFolder = Join-Path $BackupRoot $vmName
     Use-Folder $vmFolder
