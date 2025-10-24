@@ -72,6 +72,16 @@ You can of course create a desktop shortcut to run the script. In this case, the
 
 For the Export-VM and Robocopy methods, you might want to enable NTFS compression on the backup folder to save space. The 7-zip method already provides compression.
 
+## Performance Tips
+
+- **Antivirus exclusions**: Real-time antivirus scanning can significantly slow down backup operations. Consider adding exclusions for:
+  - The backup destination folder (`$BackupRoot`)
+  - The VM disk files being backed up
+  - The PowerShell script itself
+  
+- **7-zip optimization**: The default 7-zip flags use `-ms=off` (non-solid mode) which significantly speeds up writing to spinning drives. Additional optimizations:
+  - For fast CPUs with slow target drives, consider higher compression (`-mx=3` to `-mx=5`) for better space efficiency
+  - Adjust thread count (`-mmt=4`) based on your CPU cores
 
 ## Notes
 
