@@ -1,21 +1,30 @@
 <#
 .SYNOPSIS
-  Export-only backup for stopped Hyper-V VMs using timestamp-based change detection.
+  Backup for stopped Hyper-V VMs using timestamp-based change detection with Export-VM or Robocopy.
 .DESCRIPTION
-  Uses Export-VM to copy VM configuration and disks into BackupRoot\<VMName>\<timestamp>\Export.
-  For each VM, export runs only when any attached VHD/VHDX has a LastWriteTime later than the most recent backup timestamp.
+  Supports three backup methods:
+  - Export-VM: Copies VM configuration and disks into BackupRoot\<VMName>\<timestamp>\Export
+  - Robocopy: Copies only VHD/VHDX files into BackupRoot\<VMName>\<timestamp>\Disks
+  - 7zip: Compresses VHD/VHDX files into BackupRoot\<VMName>\<timestamp>\<VMName>.7z
+  For each VM, backup runs only when any attached VHD/VHDX has a LastWriteTime later than the most recent backup timestamp.
   Keeps the newest N backups per VM and prunes older ones.
 .NOTES
   - Run as Administrator on the Hyper-V host.
   - Requires Hyper-V PowerShell module.
   - Script uses folder timestamps named with format yyyy-MM-dd_HH-mm-ss to decide changes.
+  - Configure $BackupMethod: "Export" (full VM), "Robocopy" (disks only), or "7zip" (compressed disks).
+  - For 7zip method, ensure 7z.exe is in PATH or set $SevenZipPath to full executable path.
 #>
 
 #region Configuration
-$BackupRoot = "T:\Arhiv\VM"                 # where per-VM backups will be stored
+$BackupRoot = "T:\Arhiv\VMBackups"          # where per-VM backups will be stored
 $MaxBackupsPerVM = 2                        # keep the newest N backups per VM
 $TimestampFormat = "yyyy-MM-dd_HH-mm-ss"    # folder name timestamp format
 $TempSuffix = ".backupTemp"                 # suffix for temporary backup folders
+$BackupMethod = "7zip"                      # "Export" for Export-VM, "Robocopy" for file copy, "7zip" for compressed archive
+$RobocopyFlags = "/E /Z /B /MT:8 /R:3 /W:10"  # robocopy parameters (multithread, retry, etc.)
+$SevenZipPath = "7z"                        # path to 7z.exe (assumes it's in PATH)
+$SevenZipFlags = "a -t7z -mx=1 -mmt=4 -ms=off"     # 7z parameters (fastest compression, reasonable multithreading, non-solid)
 #endregion
 
 #region Helpers
@@ -117,10 +126,10 @@ foreach ($vm in $backupVMs) {
     $vmName = $vm.Name
     Write-Host "`nProcessing VM: $vmName" -ForegroundColor Cyan
 
-    #if ($vmName -ne "TumbleDev")
-    #{
-    #    continue;
-    #}
+    if ($vmName -ne "TumbleDev")
+    {
+        continue;
+    }
 
     $vmFolder = Join-Path $BackupRoot $vmName
     Use-Folder $vmFolder
@@ -137,7 +146,7 @@ foreach ($vm in $backupVMs) {
     # Gather attached VHD/VHDX paths and find the most recent LastWriteTime among them
     $hdDrives = Get-VMHardDiskDrive -VMName $vmName -ErrorAction SilentlyContinue
     if (-not $hdDrives) {
-        Write-Warning "No hard disk drives found for $vmName; skipping export."
+        Write-Warning "No hard disk drives found for $vmName; skipping backup."
         continue
     }
 
@@ -154,29 +163,29 @@ foreach ($vm in $backupVMs) {
     }
 
     if (-not $latestDiskTime) {
-        Write-Warning "Could not determine disk timestamp for $vmName; skipping export."
+        Write-Warning "Could not determine disk timestamp for $vmName; skipping backup."
         continue
     }
 
-    # Compare and decide whether to export
-    $doExport = $false
+    # Compare and decide whether to backup
+    $doBackup = $false
     if (-not $latestBackupTs) {
-        $doExport = $true
-        Write-Host "No previous backup: will export $vmName"
+        $doBackup = $true
+        Write-Host "No previous backup: will backup $vmName using $BackupMethod"
     }
     else {
         # convert latestBackupTs to UTC for fair comparison
         $latestBackupTsUtc = [datetime]::SpecifyKind($latestBackupTs, [System.DateTimeKind]::Unspecified).ToUniversalTime()
         if ($latestDiskTime -gt $latestBackupTsUtc) {
-            $doExport = $true
-            Write-Host "Disk changed since last backup: will export $vmName"
+            $doBackup = $true
+            Write-Host "Disk changed since last backup: will backup $vmName using $BackupMethod"
         }
         else {
-            Write-Host "No change detected for $vmName since latest backup at $latestBackupTs; skipping export." -ForegroundColor DarkYellow
+            Write-Host "No change detected for $vmName since latest backup at $latestBackupTs; skipping backup." -ForegroundColor DarkYellow
         }
     }
 
-    if ($doExport) {
+    if ($doBackup) {
         $timestamp = Get-Timestamp
         $thisBackupFolder = Join-Path $vmFolder $timestamp
         $tempBackupFolder = $thisBackupFolder + $TempSuffix
@@ -184,23 +193,107 @@ foreach ($vm in $backupVMs) {
         # Create temporary backup folder
         Use-Folder $tempBackupFolder
 
-        $exportPath = Join-Path $tempBackupFolder "Export"
-        Use-Folder $exportPath
-
-        Write-Host "Exporting $vmName to temporary location $exportPath" -ForegroundColor Gray
-        try {
-            Export-VM -Name $vmName -Path $exportPath -ErrorAction Stop
-            
-            # If export succeeded, atomically rename temp folder to final name
-            Write-Host "Export completed, finalizing backup for $vmName" -ForegroundColor Gray
-            Rename-Item -Path $tempBackupFolder -NewName $timestamp -ErrorAction Stop
-            Write-Host "Backup completed successfully for $vmName" -ForegroundColor Green
-            
-            # After successful backup, prune old backups
-            Remove-OldBackups -VMName $vmName -MaxKeep $MaxBackupsPerVM -BackupRoot $BackupRoot
+        $backupSuccess = $false
+        
+        if ($BackupMethod -eq "Export") {
+            $exportPath = Join-Path $tempBackupFolder "Export"
+            Use-Folder $exportPath
+            Write-Host "Exporting $vmName to temporary location $exportPath" -ForegroundColor Gray
+            try {
+                Export-VM -Name $vmName -Path $exportPath -ErrorAction Stop
+                $backupSuccess = $true
+            }
+            catch {
+                Write-Warning "Export-VM failed for ${vmName}: $_"
+            }
         }
-        catch {
-            Write-Warning "Export-VM failed for ${vmName}: $_"
+        elseif ($BackupMethod -eq "Robocopy") {
+            $disksPath = Join-Path $tempBackupFolder "Disks"
+            Use-Folder $disksPath
+            Write-Host "Copying disk files for $vmName using robocopy" -ForegroundColor Gray
+            
+            $allCopySuccess = $true
+            foreach ($hd in $hdDrives) {
+                $vhdPath = $hd.Path
+                if (-not $vhdPath -or -not (Test-Path $vhdPath)) { continue }
+                
+                $fileName = Split-Path $vhdPath -Leaf
+                $destPath = Join-Path $disksPath $fileName
+                
+                Write-Host "  Copying $fileName..." -ForegroundColor Gray
+                $robocopyCmd = "robocopy `"$(Split-Path $vhdPath -Parent)`" `"$disksPath`" `"$fileName`" $RobocopyFlags"
+                $result = Invoke-Expression $robocopyCmd
+                
+                # Robocopy exit codes 0-7 are success, 8+ are errors
+                if ($LASTEXITCODE -ge 8) {
+                    Write-Warning "Robocopy failed for $fileName (exit code: $LASTEXITCODE)"
+                    $allCopySuccess = $false
+                }
+            }
+            $backupSuccess = $allCopySuccess
+        }
+        elseif ($BackupMethod -eq "7zip") {
+            $archivePath = Join-Path $tempBackupFolder "$vmName.7z"
+            Write-Host "Compressing disk files for $vmName using 7-zip" -ForegroundColor Gray
+            
+            # Build list of disk files to compress
+            $diskFiles = @()
+            foreach ($hd in $hdDrives) {
+                $vhdPath = $hd.Path
+                if (-not $vhdPath -or -not (Test-Path $vhdPath)) { continue }
+                $diskFiles += "`"$vhdPath`""
+            }
+            
+            if ($diskFiles.Count -eq 0) {
+                Write-Warning "No valid disk files found for $vmName"
+                $backupSuccess = $false
+            }
+            else {
+                $diskFilesString = $diskFiles -join " "
+                $sevenZipCmd = "& `"$SevenZipPath`" $SevenZipFlags `"$archivePath`" $diskFilesString"
+                
+                Write-Host "  Creating archive $vmName.7z..." -ForegroundColor Gray
+                try {
+                    Invoke-Expression $sevenZipCmd
+                    # 7-zip exit code 0 = success, 1 = warning (non-fatal), 2+ = error
+                    if ($LASTEXITCODE -le 1) {
+                        $backupSuccess = $true
+                        if ($LASTEXITCODE -eq 1) {
+                            Write-Warning "7-zip completed with warnings for $vmName"
+                        }
+                    }
+                    else {
+                        Write-Warning "7-zip failed for $vmName (exit code: $LASTEXITCODE)"
+                        $backupSuccess = $false
+                    }
+                }
+                catch {
+                    Write-Warning "7-zip execution failed for ${vmName}: $_"
+                    $backupSuccess = $false
+                }
+            }
+        }
+        else {
+            Write-Warning "Unknown backup method: $BackupMethod. Use 'Export', 'Robocopy', or '7zip'."
+            $backupSuccess = $false
+        }
+        
+        if ($backupSuccess) {
+            # If backup succeeded, atomically rename temp folder to final name
+            Write-Host "Backup completed, finalizing backup for $vmName" -ForegroundColor Gray
+            try {
+                Rename-Item -Path $tempBackupFolder -NewName $timestamp -ErrorAction Stop
+                Write-Host "Backup completed successfully for $vmName" -ForegroundColor Green
+                
+                # After successful backup, prune old backups
+                Remove-OldBackups -VMName $vmName -MaxKeep $MaxBackupsPerVM -BackupRoot $BackupRoot
+            }
+            catch {
+                Write-Warning "Failed to finalize backup for ${vmName}: $_"
+                try { Remove-Item -Path $tempBackupFolder -Recurse -Force -ErrorAction Stop } catch { }
+            }
+        }
+        else {
             Write-Warning "Removing incomplete backup folder $tempBackupFolder"
             try { Remove-Item -Path $tempBackupFolder -Recurse -Force -ErrorAction Stop } catch { }
             continue
